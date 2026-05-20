@@ -6,16 +6,25 @@ Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (9
 
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
-import { useGLTF, useTexture } from '@react-three/drei'
-import { MathUtils, MeshStandardMaterial, SRGBColorSpace } from 'three'
+import { useGLTF } from '@react-three/drei'
+import {
+  Color,
+  DataTexture,
+  MathUtils,
+  MeshPhysicalMaterial,
+  MeshStandardMaterial,
+  RGBAFormat,
+  RepeatWrapping,
+} from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
 const BREATH_AMPLITUDE = 0.02
-const EXTERNAL_TEXTURES = {
-  baseColor: '/textures/koru-basecolor.png',
-  roughness: '/textures/koru-roughness.png',
-  normal: '/textures/koru-normal.png',
+const PALETTE = {
+  fur: '#006666',
+  mask: '#71717a',
+  accent: '#09090b',
+  eyes: '#d97706',
 }
 
 function getBreathPulse(phase) {
@@ -30,6 +39,112 @@ function getBreathPulse(phase) {
   return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
+function classifyMeshRole(name = '') {
+  const lower = name.toLowerCase()
+  if (/eye|iris|pupil|cornea/.test(lower)) return 'eyes'
+  if (/mask|face|facial|snout|muzzle|cheek/.test(lower)) return 'mask'
+  if (/tail|back|stripe|mark|pattern/.test(lower)) return 'accent'
+  return 'fur'
+}
+
+function createNoiseTexture(size = 128) {
+  const rgba = new Uint8Array(size * size * 4)
+
+  for (let i = 0; i < rgba.length; i += 4) {
+    const noise = Math.floor(Math.random() * 256)
+    rgba[i] = noise
+    rgba[i + 1] = noise
+    rgba[i + 2] = noise
+    rgba[i + 3] = 255
+  }
+
+  const texture = new DataTexture(rgba, size, size, RGBAFormat)
+  texture.wrapS = RepeatWrapping
+  texture.wrapT = RepeatWrapping
+  texture.repeat.set(22, 22)
+  texture.needsUpdate = true
+  return texture
+}
+
+function applySoftFurFinish(material, bumpTexture) {
+  material.bumpMap = bumpTexture
+  material.bumpScale = 0.015
+  material.roughness = 0.95
+  material.metalness = 0.05
+  material.needsUpdate = true
+}
+
+function applyProceduralPaletteFallback(material) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uFurColor = { value: new Color(PALETTE.fur) }
+    shader.uniforms.uMaskColor = { value: new Color(PALETTE.mask) }
+    shader.uniforms.uAccentColor = { value: new Color(PALETTE.accent) }
+
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <common>',
+      '#include <common>\nvarying vec3 vLocalPosition;',
+    )
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      '#include <begin_vertex>\nvLocalPosition = position;',
+    )
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <common>',
+      `#include <common>
+varying vec3 vLocalPosition;
+uniform vec3 uFurColor;
+uniform vec3 uMaskColor;
+uniform vec3 uAccentColor;`,
+    )
+    shader.fragmentShader = shader.fragmentShader.replace(
+      'vec4 diffuseColor = vec4( diffuse, opacity );',
+      `vec4 diffuseColor = vec4( diffuse, opacity );
+float faceMask = smoothstep(0.08, 0.36, vLocalPosition.z) * (1.0 - smoothstep(0.22, 0.85, abs(vLocalPosition.x))) * smoothstep(-0.40, 0.46, vLocalPosition.y);
+float backRegion = smoothstep(-0.60, -0.10, vLocalPosition.z);
+float stripes = step(0.62, fract((vLocalPosition.x + vLocalPosition.y * 0.55) * 8.5 + sin(vLocalPosition.y * 30.0) * 0.08));
+float accentMask = backRegion * stripes;
+vec3 paletteColor = mix(uFurColor, uMaskColor, clamp(faceMask, 0.0, 1.0));
+paletteColor = mix(paletteColor, uAccentColor, clamp(accentMask, 0.0, 1.0));
+diffuseColor.rgb *= paletteColor;`,
+    )
+  }
+
+  material.customProgramCacheKey = () => 'koru-procedural-palette-v1'
+  material.needsUpdate = true
+}
+
+function applyProceduralEyeMask(material) {
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <common>',
+      '#include <common>\nvarying vec3 vLocalPosition;',
+    )
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      '#include <begin_vertex>\nvLocalPosition = position;',
+    )
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <common>',
+      '#include <common>\nvarying vec3 vLocalPosition;',
+    )
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      'vec4 diffuseColor = vec4( diffuse, opacity );',
+      `vec4 diffuseColor = vec4( diffuse, opacity );
+float leftEye = smoothstep(0.115, 0.0, distance(vLocalPosition, vec3(-0.16, 0.12, 0.33)));
+float rightEye = smoothstep(0.115, 0.0, distance(vLocalPosition, vec3(0.16, 0.12, 0.33)));
+float eyeMask = max(leftEye, rightEye);
+if (eyeMask < 0.01) discard;
+diffuseColor.a = eyeMask;`,
+    )
+  }
+
+  material.customProgramCacheKey = () => 'koru-procedural-eyes-v1'
+  material.needsUpdate = true
+}
+
 export function Koru(props) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
@@ -37,7 +152,7 @@ export function Koru(props) {
   const baseBodyScale = useRef(null)
   const baseHeadRotation = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
-  const externalMaps = useTexture(EXTERNAL_TEXTURES)
+  const bumpNoiseTexture = useMemo(() => createNoiseTexture(), [])
   const meshNodes = useMemo(() => {
     return Object.values(nodes).filter((node) => node?.isMesh)
   }, [nodes])
@@ -51,38 +166,100 @@ export function Koru(props) {
       scale: node.scale.toArray(),
     }))
   }, [meshNodes])
+  const roleCounts = useMemo(() => {
+    return meshDescriptors.reduce(
+      (accumulator, mesh) => {
+        const role = classifyMeshRole(mesh.name)
+        accumulator[role] += 1
+        return accumulator
+      },
+      { fur: 0, mask: 0, accent: 0, eyes: 0 },
+    )
+  }, [meshDescriptors])
+  const needsProceduralPaletteFallback = roleCounts.mask === 0 || roleCounts.accent === 0
+  const needsProceduralEyeFallback = roleCounts.eyes === 0
 
-  const overrideMaterial = useMemo(() => {
+  const furMaterial = useMemo(() => {
     const sourceMaterial = materialFallback?.isMeshStandardMaterial
       ? materialFallback.clone()
       : new MeshStandardMaterial()
 
-    sourceMaterial.name = 'KoruExternalTextureOverride'
-    sourceMaterial.map = externalMaps.baseColor
-    sourceMaterial.roughnessMap = externalMaps.roughness
-    sourceMaterial.normalMap = externalMaps.normal
-    sourceMaterial.map.colorSpace = SRGBColorSpace
-    sourceMaterial.map.flipY = false
-    sourceMaterial.roughnessMap.flipY = false
-    sourceMaterial.normalMap.flipY = false
-    sourceMaterial.normalScale.set(0.85, 0.85)
-    sourceMaterial.roughness = 1
-    sourceMaterial.metalness = 0.04
-    sourceMaterial.needsUpdate = true
+    sourceMaterial.name = 'KoruFurMaterial'
+    sourceMaterial.color.set(PALETTE.fur)
+    applySoftFurFinish(sourceMaterial, bumpNoiseTexture)
 
+    if (needsProceduralPaletteFallback) {
+      applyProceduralPaletteFallback(sourceMaterial)
+    }
+
+    sourceMaterial.needsUpdate = true
     return sourceMaterial
-  }, [
-    materialFallback,
-    externalMaps.baseColor,
-    externalMaps.roughness,
-    externalMaps.normal,
-  ])
+  }, [bumpNoiseTexture, materialFallback, needsProceduralPaletteFallback])
+
+  const maskMaterial = useMemo(() => {
+    const sourceMaterial = furMaterial.clone()
+    sourceMaterial.name = 'KoruFacialMaskMaterial'
+    sourceMaterial.color.set(PALETTE.mask)
+    sourceMaterial.needsUpdate = true
+    return sourceMaterial
+  }, [furMaterial])
+
+  const accentMaterial = useMemo(() => {
+    const sourceMaterial = furMaterial.clone()
+    sourceMaterial.name = 'KoruAccentMaterial'
+    sourceMaterial.color.set(PALETTE.accent)
+    sourceMaterial.needsUpdate = true
+    return sourceMaterial
+  }, [furMaterial])
+
+  const eyeMaterial = useMemo(() => {
+    const sourceMaterial = new MeshPhysicalMaterial()
+    sourceMaterial.name = 'KoruEyeMaterial'
+    sourceMaterial.color.set(PALETTE.eyes)
+    sourceMaterial.clearcoat = 1
+    sourceMaterial.clearcoatRoughness = 0.06
+    sourceMaterial.roughness = 0.1
+    sourceMaterial.metalness = 0.05
+    sourceMaterial.bumpMap = bumpNoiseTexture
+    sourceMaterial.bumpScale = 0.004
+    sourceMaterial.envMapIntensity = 1.3
+    sourceMaterial.needsUpdate = true
+    return sourceMaterial
+  }, [bumpNoiseTexture])
+
+  const proceduralEyeMaterial = useMemo(() => {
+    if (!needsProceduralEyeFallback) {
+      return null
+    }
+
+    const sourceMaterial = new MeshPhysicalMaterial({
+      color: PALETTE.eyes,
+      transparent: true,
+      depthWrite: false,
+      clearcoat: 1,
+      clearcoatRoughness: 0.04,
+      roughness: 0.1,
+      metalness: 0.05,
+      envMapIntensity: 1.4,
+      bumpMap: bumpNoiseTexture,
+      bumpScale: 0.004,
+    })
+    sourceMaterial.name = 'KoruProceduralEyeOverlayMaterial'
+    applyProceduralEyeMask(sourceMaterial)
+    sourceMaterial.needsUpdate = true
+    return sourceMaterial
+  }, [bumpNoiseTexture, needsProceduralEyeFallback])
 
   useEffect(() => {
     return () => {
-      overrideMaterial.dispose()
+      furMaterial.dispose()
+      maskMaterial.dispose()
+      accentMaterial.dispose()
+      eyeMaterial.dispose()
+      proceduralEyeMaterial?.dispose()
+      bumpNoiseTexture.dispose()
     }
-  }, [overrideMaterial])
+  }, [accentMaterial, bumpNoiseTexture, eyeMaterial, furMaterial, maskMaterial, proceduralEyeMaterial])
 
   const headBone = useMemo(() => {
     const graphNodes = Object.values(nodes)
@@ -163,23 +340,49 @@ export function Koru(props) {
       onPointerUp={() => setInteracting(0)}
     >
       <group ref={bodyRef}>
-        {meshDescriptors.map((mesh) => (
-          <mesh
-            key={mesh.key}
-            name={mesh.name}
-            geometry={mesh.geometry}
-            position={mesh.position}
-            rotation={mesh.rotation}
-            scale={mesh.scale}
-            material={overrideMaterial}
-            castShadow
-            receiveShadow
-          />
-        ))}
+        {meshDescriptors.map((mesh) => {
+          const role = classifyMeshRole(mesh.name)
+          const materialForMesh =
+            role === 'eyes'
+              ? eyeMaterial
+              : role === 'mask'
+                ? maskMaterial
+                : role === 'accent'
+                  ? accentMaterial
+                  : furMaterial
+
+          return (
+            <mesh
+              key={mesh.key}
+              name={mesh.name}
+              geometry={mesh.geometry}
+              position={mesh.position}
+              rotation={mesh.rotation}
+              scale={mesh.scale}
+              material={materialForMesh}
+              castShadow
+              receiveShadow
+            />
+          )
+        })}
+        {needsProceduralEyeFallback &&
+          proceduralEyeMaterial &&
+          meshDescriptors.map((mesh) => (
+            <mesh
+              key={`${mesh.key}-eye-overlay`}
+              name={`${mesh.name}-eye-overlay`}
+              geometry={mesh.geometry}
+              position={mesh.position}
+              rotation={mesh.rotation}
+              scale={mesh.scale}
+              material={proceduralEyeMaterial}
+              renderOrder={2}
+              frustumCulled={false}
+            />
+          ))}
       </group>
     </group>
   )
 }
 
 useGLTF.preload('/Koru.glb')
-useTexture.preload(EXTERNAL_TEXTURES)
