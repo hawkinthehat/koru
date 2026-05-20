@@ -4,14 +4,22 @@ Command: npx gltfjsx@6.5.3 public/Koru.glb --transform
 Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (95%)
 */
 
-import { useMemo, useRef } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useGLTF } from '@react-three/drei'
-import { MathUtils } from 'three'
+import {
+  BufferAttribute,
+  CanvasTexture,
+  MathUtils,
+  MeshStandardMaterial,
+  NoColorSpace,
+  SRGBColorSpace,
+} from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
 const BREATH_AMPLITUDE = 0.02
+const REFERENCE_TEXTURE_PATH = '/koru-texture.png'
 
 function getBreathPulse(phase) {
   if (phase < 4) {
@@ -25,19 +33,286 @@ function getBreathPulse(phase) {
   return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
+function disposeTextureSet(textureSet) {
+  if (!textureSet) {
+    return
+  }
+
+  textureSet.baseColor.dispose()
+  textureSet.roughness.dispose()
+  textureSet.normal.dispose()
+}
+
+function createProjectedUvGeometry(sourceGeometry) {
+  const geometry = sourceGeometry.clone()
+
+  if (!geometry.attributes.normal) {
+    geometry.computeVertexNormals()
+  }
+
+  if (!geometry.attributes.uv) {
+    geometry.computeBoundingBox()
+    const position = geometry.attributes.position
+    const boundingBox = geometry.boundingBox
+    const uvs = new Float32Array(position.count * 2)
+
+    const centerX = (boundingBox.min.x + boundingBox.max.x) * 0.5
+    const centerZ = (boundingBox.min.z + boundingBox.max.z) * 0.5
+    const height = Math.max(boundingBox.max.y - boundingBox.min.y, 1e-5)
+
+    for (let index = 0; index < position.count; index += 1) {
+      const x = position.getX(index) - centerX
+      const y = position.getY(index)
+      const z = position.getZ(index) - centerZ
+
+      const azimuth = Math.atan2(z, x)
+      const u = (azimuth + Math.PI) / (Math.PI * 2)
+      const v = 1 - (y - boundingBox.min.y) / height
+
+      uvs[index * 2] = u
+      uvs[index * 2 + 1] = MathUtils.clamp(v, 0, 1)
+    }
+
+    geometry.setAttribute('uv', new BufferAttribute(uvs, 2))
+  }
+
+  return geometry
+}
+
+function createPbrTexturesFromReference(image, anisotropy) {
+  const width = image.naturalWidth || image.width
+  const height = image.naturalHeight || image.height
+
+  if (!width || !height) {
+    return null
+  }
+
+  const sourceCanvas = document.createElement('canvas')
+  sourceCanvas.width = width
+  sourceCanvas.height = height
+  const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true })
+
+  if (!sourceContext) {
+    return null
+  }
+
+  sourceContext.drawImage(image, 0, 0, width, height)
+  const sourceImage = sourceContext.getImageData(0, 0, width, height)
+  const sourcePixels = sourceImage.data
+
+  const roughnessCanvas = document.createElement('canvas')
+  roughnessCanvas.width = width
+  roughnessCanvas.height = height
+  const roughnessContext = roughnessCanvas.getContext('2d')
+
+  const normalCanvas = document.createElement('canvas')
+  normalCanvas.width = width
+  normalCanvas.height = height
+  const normalContext = normalCanvas.getContext('2d')
+
+  if (!roughnessContext || !normalContext) {
+    return null
+  }
+
+  const roughnessImage = roughnessContext.createImageData(width, height)
+  const normalImage = normalContext.createImageData(width, height)
+  const roughnessPixels = roughnessImage.data
+  const normalPixels = normalImage.data
+  const heightField = new Float32Array(width * height)
+
+  for (let index = 0; index < width * height; index += 1) {
+    const offset = index * 4
+    const red = sourcePixels[offset] / 255
+    const green = sourcePixels[offset + 1] / 255
+    const blue = sourcePixels[offset + 2] / 255
+    const alpha = sourcePixels[offset + 3]
+
+    const maxChannel = Math.max(red, green, blue)
+    const minChannel = Math.min(red, green, blue)
+    const luma = red * 0.2126 + green * 0.7152 + blue * 0.0722
+    const saturation = maxChannel - minChannel
+    const tealAccent = green > red * 1.08 && blue > red * 1.1
+    const darkFeature = luma < 0.1
+
+    // Fur is intentionally rough, teal woven accents are slightly smoother,
+    // and dark mask details stay a bit glossier to avoid a chalky look.
+    let roughness = 0.62 + (1 - luma) * 0.25 + saturation * 0.08
+
+    if (tealAccent) {
+      roughness = 0.44 + (1 - luma) * 0.22
+    } else if (darkFeature) {
+      roughness = 0.22 + saturation * 0.35
+    }
+
+    roughness = MathUtils.clamp(roughness, 0.08, 0.96)
+    const roughnessValue = Math.round(roughness * 255)
+
+    roughnessPixels[offset] = roughnessValue
+    roughnessPixels[offset + 1] = roughnessValue
+    roughnessPixels[offset + 2] = roughnessValue
+    roughnessPixels[offset + 3] = alpha
+
+    heightField[index] = (1 - luma) * 0.7 + saturation * 0.3
+  }
+
+  const sampleHeight = (x, y) => {
+    const clampedX = MathUtils.clamp(x, 0, width - 1)
+    const clampedY = MathUtils.clamp(y, 0, height - 1)
+    return heightField[clampedY * width + clampedX]
+  }
+
+  const normalStrength = 1.35
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4
+      const dX = sampleHeight(x + 1, y) - sampleHeight(x - 1, y)
+      const dY = sampleHeight(x, y + 1) - sampleHeight(x, y - 1)
+
+      let nX = -dX * normalStrength
+      let nY = -dY * normalStrength
+      let nZ = 1
+      const normalLength = Math.hypot(nX, nY, nZ) || 1
+
+      nX /= normalLength
+      nY /= normalLength
+      nZ /= normalLength
+
+      normalPixels[offset] = Math.round((nX * 0.5 + 0.5) * 255)
+      normalPixels[offset + 1] = Math.round((nY * 0.5 + 0.5) * 255)
+      normalPixels[offset + 2] = Math.round((nZ * 0.5 + 0.5) * 255)
+      normalPixels[offset + 3] = sourcePixels[offset + 3]
+    }
+  }
+
+  roughnessContext.putImageData(roughnessImage, 0, 0)
+  normalContext.putImageData(normalImage, 0, 0)
+
+  const baseColorTexture = new CanvasTexture(sourceCanvas)
+  const roughnessTexture = new CanvasTexture(roughnessCanvas)
+  const normalTexture = new CanvasTexture(normalCanvas)
+
+  baseColorTexture.flipY = false
+  roughnessTexture.flipY = false
+  normalTexture.flipY = false
+
+  baseColorTexture.colorSpace = SRGBColorSpace
+  roughnessTexture.colorSpace = NoColorSpace
+  normalTexture.colorSpace = NoColorSpace
+
+  baseColorTexture.anisotropy = anisotropy
+  roughnessTexture.anisotropy = anisotropy
+  normalTexture.anisotropy = anisotropy
+
+  return {
+    baseColor: baseColorTexture,
+    roughness: roughnessTexture,
+    normal: normalTexture,
+  }
+}
+
 export function Koru(props) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
   const headPivotRef = useRef(null)
   const interactionTarget = useRef(0)
+  const latestTextureSet = useRef(null)
   const baseBodyScale = useRef(null)
+  const maxAnisotropy = useThree((state) => state.gl.capabilities.getMaxAnisotropy())
+  const [pbrTextures, setPbrTextures] = useState(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
+  const meshNodes = useMemo(() => {
+    return Object.values(nodes).filter((node) => node.isMesh && node.geometry)
+  }, [nodes])
+  const projectedGeometries = useMemo(() => {
+    const geometryByName = new Map()
+
+    meshNodes.forEach((meshNode) => {
+      geometryByName.set(meshNode.name, createProjectedUvGeometry(meshNode.geometry))
+    })
+
+    return geometryByName
+  }, [meshNodes])
+
+  useEffect(() => {
+    return () => {
+      projectedGeometries.forEach((geometry) => geometry.dispose())
+    }
+  }, [projectedGeometries])
 
   const headBone = useMemo(() => {
     return Object.values(nodes).find((node) => {
       return node.isBone && /head|skull|neck/i.test(node.name)
     })
   }, [nodes])
+  const textureOverrideMaterial = useMemo(() => {
+    if (!pbrTextures) {
+      return null
+    }
+
+    return new MeshStandardMaterial({
+      map: pbrTextures.baseColor,
+      roughnessMap: pbrTextures.roughness,
+      normalMap: pbrTextures.normal,
+      roughness: 1,
+      metalness: 0.06,
+    })
+  }, [pbrTextures])
+
+  useEffect(() => {
+    return () => {
+      textureOverrideMaterial?.dispose()
+    }
+  }, [textureOverrideMaterial])
+
+  useEffect(() => {
+    latestTextureSet.current = pbrTextures
+  }, [pbrTextures])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined
+    }
+
+    let disposed = false
+    const referenceImage = new window.Image()
+    referenceImage.src = REFERENCE_TEXTURE_PATH
+    referenceImage.decoding = 'async'
+
+    referenceImage.onload = () => {
+      if (disposed) {
+        return
+      }
+
+      const generatedTextures = createPbrTexturesFromReference(referenceImage, maxAnisotropy)
+      latestTextureSet.current = generatedTextures
+      setPbrTextures((previousTextures) => {
+        disposeTextureSet(previousTextures)
+        return generatedTextures
+      })
+    }
+
+    referenceImage.onerror = () => {
+      if (disposed) {
+        return
+      }
+
+      console.warn(
+        `Koru external texture override could not load "${REFERENCE_TEXTURE_PATH}". Falling back to GLB material data.`,
+      )
+      latestTextureSet.current = null
+      setPbrTextures((previousTextures) => {
+        disposeTextureSet(previousTextures)
+        return null
+      })
+    }
+
+    return () => {
+      disposed = true
+      disposeTextureSet(latestTextureSet.current)
+      latestTextureSet.current = null
+    }
+  }, [maxAnisotropy])
 
   useFrame(({ clock }, delta) => {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
@@ -84,13 +359,17 @@ export function Koru(props) {
       onPointerUp={() => setInteracting(0)}
     >
       <group ref={headPivotRef}>
-        <mesh
-          ref={bodyRef}
-          geometry={nodes.Mesh10.geometry}
-          material={nodes.Mesh10.material ?? materialFallback}
-          castShadow
-          receiveShadow
-        />
+        <group ref={bodyRef}>
+          {meshNodes.map((meshNode, index) => (
+            <mesh
+              key={`${meshNode.name}-${index}`}
+              geometry={projectedGeometries.get(meshNode.name) ?? meshNode.geometry}
+              material={textureOverrideMaterial ?? meshNode.material ?? materialFallback}
+              castShadow
+              receiveShadow
+            />
+          ))}
+        </group>
       </group>
     </group>
   )
