@@ -22,13 +22,14 @@ export default function App() {
           dpr={[1, 2]}
         >
           <color attach="background" args={['#10151f']} />
-          <ambientLight intensity={1.2} />
+          <ambientLight intensity={0.7} />
           <directionalLight
-            position={[3.5, 4.5, 2.5]}
-            intensity={2.4}
+            position={[5, 10, 5]}
+            intensity={1.5}
             castShadow
             shadow-mapSize={[1024, 1024]}
           />
+          <pointLight position={[-5, 5, -5]} intensity={0.5} color="#008080" />
           <Suspense fallback={null}>
             <Center>
               <Koru rotation={[0, -0.18, 0]} scale={2.2} />
