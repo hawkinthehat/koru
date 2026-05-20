@@ -4,14 +4,19 @@ Command: npx gltfjsx@6.5.3 public/Koru.glb --transform
 Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (95%)
 */
 
-import { useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
-import { useGLTF } from '@react-three/drei'
-import { MathUtils } from 'three'
+import { useGLTF, useTexture } from '@react-three/drei'
+import { MathUtils, MeshStandardMaterial, SRGBColorSpace } from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
 const BREATH_AMPLITUDE = 0.02
+const EXTERNAL_TEXTURES = {
+  baseColor: '/textures/koru-basecolor.png',
+  roughness: '/textures/koru-roughness.png',
+  normal: '/textures/koru-normal.png',
+}
 
 function getBreathPulse(phase) {
   if (phase < 4) {
@@ -32,6 +37,52 @@ export function Koru(props) {
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
+  const externalMaps = useTexture(EXTERNAL_TEXTURES)
+  const meshNodes = useMemo(() => {
+    return Object.values(nodes).filter((node) => node?.isMesh)
+  }, [nodes])
+  const meshDescriptors = useMemo(() => {
+    return meshNodes.map((node) => ({
+      key: node.uuid,
+      name: node.name,
+      geometry: node.geometry,
+      position: node.position.toArray(),
+      rotation: [node.rotation.x, node.rotation.y, node.rotation.z],
+      scale: node.scale.toArray(),
+    }))
+  }, [meshNodes])
+
+  const overrideMaterial = useMemo(() => {
+    const sourceMaterial = materialFallback?.isMeshStandardMaterial
+      ? materialFallback.clone()
+      : new MeshStandardMaterial()
+
+    sourceMaterial.name = 'KoruExternalTextureOverride'
+    sourceMaterial.map = externalMaps.baseColor
+    sourceMaterial.roughnessMap = externalMaps.roughness
+    sourceMaterial.normalMap = externalMaps.normal
+    sourceMaterial.map.colorSpace = SRGBColorSpace
+    sourceMaterial.map.flipY = false
+    sourceMaterial.roughnessMap.flipY = false
+    sourceMaterial.normalMap.flipY = false
+    sourceMaterial.normalScale.set(0.85, 0.85)
+    sourceMaterial.roughness = 1
+    sourceMaterial.metalness = 0.04
+    sourceMaterial.needsUpdate = true
+
+    return sourceMaterial
+  }, [
+    materialFallback,
+    externalMaps.baseColor,
+    externalMaps.roughness,
+    externalMaps.normal,
+  ])
+
+  useEffect(() => {
+    return () => {
+      overrideMaterial.dispose()
+    }
+  }, [overrideMaterial])
 
   const headBone = useMemo(() => {
     return Object.values(nodes).find((node) => {
@@ -84,16 +135,25 @@ export function Koru(props) {
       onPointerUp={() => setInteracting(0)}
     >
       <group ref={headPivotRef}>
-        <mesh
-          ref={bodyRef}
-          geometry={nodes.Mesh10.geometry}
-          material={nodes.Mesh10.material ?? materialFallback}
-          castShadow
-          receiveShadow
-        />
+        <group ref={bodyRef}>
+          {meshDescriptors.map((mesh) => (
+            <mesh
+              key={mesh.key}
+              name={mesh.name}
+              geometry={mesh.geometry}
+              position={mesh.position}
+              rotation={mesh.rotation}
+              scale={mesh.scale}
+              material={overrideMaterial}
+              castShadow
+              receiveShadow
+            />
+          ))}
+        </group>
       </group>
     </group>
   )
 }
 
 useGLTF.preload('/Koru.glb')
+useTexture.preload(EXTERNAL_TEXTURES)
