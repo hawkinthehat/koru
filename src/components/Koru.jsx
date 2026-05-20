@@ -11,24 +11,27 @@ import { MathUtils } from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
+const BREATH_AMPLITUDE = 0.02
 
-function getBreathLift(phase) {
+function getBreathPulse(phase) {
   if (phase < 4) {
-    return MathUtils.smoothstep(phase / 4, 0, 1)
+    return Math.sin((phase / 4) * (Math.PI / 2))
   }
 
   if (phase < 11) {
     return 1
   }
 
-  return 1 - MathUtils.smoothstep((phase - 11) / 8, 0, 1)
+  return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
 export function Koru(props) {
-  const { nodes } = useGLTF('/Koru-transformed.glb')
+  const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
   const headPivotRef = useRef(null)
   const interactionTarget = useRef(0)
+  const baseBodyScale = useRef(null)
+  const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
 
   const headBone = useMemo(() => {
     return Object.values(nodes).find((node) => {
@@ -38,18 +41,26 @@ export function Koru(props) {
 
   useFrame(({ clock }, delta) => {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
-    const breathLift = getBreathLift(phase)
+    const breathPulse = getBreathPulse(phase)
     const body = bodyRef.current
 
     if (body) {
-      body.scale.y = MathUtils.lerp(body.scale.y, 1 + breathLift * 0.055, 0.08)
+      if (!baseBodyScale.current) {
+        baseBodyScale.current = body.scale.clone()
+      }
+      const targetScale = 1 + breathPulse * BREATH_AMPLITUDE
+      const easing = 1 - Math.exp(-4 * delta)
+      body.scale.x = MathUtils.lerp(body.scale.x, baseBodyScale.current.x * targetScale, easing)
+      body.scale.y = MathUtils.lerp(body.scale.y, baseBodyScale.current.y * targetScale, easing)
+      body.scale.z = MathUtils.lerp(body.scale.z, baseBodyScale.current.z * targetScale, easing)
     }
 
     const tiltTarget = interactionTarget.current * HEAD_TILT_RADIANS
     const tiltNode = headBone || headPivotRef.current
 
     if (tiltNode) {
-      tiltNode.rotation.z = MathUtils.damp(tiltNode.rotation.z, tiltTarget, 5, delta)
+      const tiltEasing = 1 - Math.exp(-8 * delta)
+      tiltNode.rotation.z = MathUtils.lerp(tiltNode.rotation.z, tiltTarget, tiltEasing)
     }
   })
 
@@ -76,7 +87,7 @@ export function Koru(props) {
         <mesh
           ref={bodyRef}
           geometry={nodes.Mesh10.geometry}
-          material={nodes.Mesh10.material}
+          material={nodes.Mesh10.material ?? materialFallback}
           castShadow
           receiveShadow
         />
@@ -85,4 +96,4 @@ export function Koru(props) {
   )
 }
 
-useGLTF.preload('/Koru-transformed.glb')
+useGLTF.preload('/Koru.glb')
