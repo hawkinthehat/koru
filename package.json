@@ -1,0 +1,34 @@
+{
+  "name": "koru-grounding-companion",
+  "version": "1.0.0",
+  "description": "An interactive 3D web application for somatic grounding and anxiety management.",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hawkinthehat/koru.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/hawkinthehat/koru/issues"
+  },
+  "homepage": "https://github.com/hawkinthehat/koru#readme",
+  "dependencies": {
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.6.1",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.2",
+    "vite": "^8.0.13"
+  },
+  "private": true,
+  "type": "module"
+}
