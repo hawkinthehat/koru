@@ -33,9 +33,9 @@ function getBreathPulse(phase) {
 export function Koru(props) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
-  const headPivotRef = useRef(null)
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
+  const baseHeadRotation = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
   const externalMaps = useTexture(EXTERNAL_TEXTURES)
   const meshNodes = useMemo(() => {
@@ -85,12 +85,24 @@ export function Koru(props) {
   }, [overrideMaterial])
 
   const headBone = useMemo(() => {
-    return Object.values(nodes).find((node) => {
-      return node.isBone && /head|skull|neck/i.test(node.name)
+    const graphNodes = Object.values(nodes)
+    const directBoneMatch = graphNodes.find((node) => {
+      return node?.isBone && /head|neck|skull/i.test(node.name)
     })
+
+    if (directBoneMatch) {
+      return directBoneMatch
+    }
+
+    const skeletonBoneMatch = graphNodes
+      .filter((node) => node?.isSkinnedMesh && node.skeleton?.bones?.length)
+      .flatMap((node) => node.skeleton.bones)
+      .find((bone) => /head|neck|skull/i.test(bone.name))
+
+    return skeletonBoneMatch ?? null
   }, [nodes])
 
-  useFrame(({ clock }, delta) => {
+  useFrame(({ clock, pointer }, delta) => {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
     const breathPulse = getBreathPulse(phase)
     const body = bodyRef.current
@@ -106,12 +118,28 @@ export function Koru(props) {
       body.scale.z = MathUtils.lerp(body.scale.z, baseBodyScale.current.z * targetScale, easing)
     }
 
-    const tiltTarget = interactionTarget.current * HEAD_TILT_RADIANS
-    const tiltNode = headBone || headPivotRef.current
+    if (headBone) {
+      if (!baseHeadRotation.current) {
+        baseHeadRotation.current = {
+          x: headBone.rotation.x,
+          y: headBone.rotation.y,
+        }
+      }
 
-    if (tiltNode) {
+      const targetYaw = MathUtils.clamp(pointer.x, -1, 1) * HEAD_TILT_RADIANS * interactionTarget.current
+      const targetPitch =
+        MathUtils.clamp(-pointer.y, -1, 1) * HEAD_TILT_RADIANS * 0.6 * interactionTarget.current
       const tiltEasing = 1 - Math.exp(-8 * delta)
-      tiltNode.rotation.z = MathUtils.lerp(tiltNode.rotation.z, tiltTarget, tiltEasing)
+      headBone.rotation.y = MathUtils.lerp(
+        headBone.rotation.y,
+        baseHeadRotation.current.y + targetYaw,
+        tiltEasing,
+      )
+      headBone.rotation.x = MathUtils.lerp(
+        headBone.rotation.x,
+        baseHeadRotation.current.x + targetPitch,
+        tiltEasing,
+      )
     }
   })
 
@@ -134,22 +162,20 @@ export function Koru(props) {
       }}
       onPointerUp={() => setInteracting(0)}
     >
-      <group ref={headPivotRef}>
-        <group ref={bodyRef}>
-          {meshDescriptors.map((mesh) => (
-            <mesh
-              key={mesh.key}
-              name={mesh.name}
-              geometry={mesh.geometry}
-              position={mesh.position}
-              rotation={mesh.rotation}
-              scale={mesh.scale}
-              material={overrideMaterial}
-              castShadow
-              receiveShadow
-            />
-          ))}
-        </group>
+      <group ref={bodyRef}>
+        {meshDescriptors.map((mesh) => (
+          <mesh
+            key={mesh.key}
+            name={mesh.name}
+            geometry={mesh.geometry}
+            position={mesh.position}
+            rotation={mesh.rotation}
+            scale={mesh.scale}
+            material={overrideMaterial}
+            castShadow
+            receiveShadow
+          />
+        ))}
       </group>
     </group>
   )
