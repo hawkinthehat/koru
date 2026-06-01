@@ -4,10 +4,11 @@ Command: npx gltfjsx@6.5.3 public/Koru.glb --transform
 Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (95%)
 */
 
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { useGLTF, useTexture } from '@react-three/drei'
-import { MathUtils, MeshStandardMaterial, SRGBColorSpace } from 'three'
+import { useGesture } from '@use-gesture/react'
+import { Box3, MathUtils, MeshStandardMaterial, SRGBColorSpace, Vector3 } from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
@@ -17,6 +18,147 @@ const EXTERNAL_TEXTURES = {
   roughness: '/textures/koru-roughness.png',
   normal: '/textures/koru-normal.png',
 }
+const CARVING_LINES = [
+  {
+    name: 'inner-flow',
+    yStart: 0.18,
+    yEnd: 0.78,
+    halfOffset: 0.11,
+    curve: 0.055,
+    radius: 0.035,
+  },
+  {
+    name: 'middle-flow',
+    yStart: 0.28,
+    yEnd: 0.88,
+    halfOffset: 0.205,
+    curve: -0.04,
+    radius: 0.032,
+  },
+  {
+    name: 'outer-flow',
+    yStart: 0.08,
+    yEnd: 0.66,
+    halfOffset: 0.305,
+    curve: 0.045,
+    radius: 0.038,
+  },
+]
+const CARVING_LINE_COUNT = CARVING_LINES.length
+const MIRROR_SIDE = {
+  left: 'right',
+  right: 'left',
+}
+const SIDE_SIGNS = {
+  left: -1,
+  right: 1,
+}
+
+const lineDataGlsl = CARVING_LINES.map((line, index) => {
+  const fallbackPrefix = index === 0 ? '' : 'else '
+
+  return `${fallbackPrefix}if (lineIndex == ${index}) {
+    return vec4(${line.yStart.toFixed(4)}, ${line.yEnd.toFixed(4)}, ${line.halfOffset.toFixed(4)}, ${line.curve.toFixed(4)});
+  }`
+}).join('\n')
+
+const lineRadiusGlsl = CARVING_LINES.map((line, index) => {
+  const fallbackPrefix = index === 0 ? '' : 'else '
+
+  return `${fallbackPrefix}if (lineIndex == ${index}) {
+    return ${line.radius.toFixed(4)};
+  }`
+}).join('\n')
+
+const directMaskGlsl = CARVING_LINES.map((_, index) => {
+  return `mask = max(mask, getCarvingMask(stainUv, ${index}, -1.0, uStainProgressLeft[${index}]));
+  mask = max(mask, getCarvingMask(stainUv, ${index}, 1.0, uStainProgressRight[${index}]));`
+}).join('\n  ')
+
+const mirrorMaskGlsl = CARVING_LINES.map((_, index) => {
+  return `mask = max(mask, getCarvingMask(stainUv, ${index}, -1.0, uMirrorProgressLeft[${index}]));
+  mask = max(mask, getCarvingMask(stainUv, ${index}, 1.0, uMirrorProgressRight[${index}]));`
+}).join('\n  ')
+
+const STAIN_SHADER_COMMON = `
+#define KORU_STAIN_LINE_COUNT ${CARVING_LINE_COUNT}
+uniform float uTime;
+uniform float uStainIntensity;
+uniform float uStainProgressLeft[KORU_STAIN_LINE_COUNT];
+uniform float uStainProgressRight[KORU_STAIN_LINE_COUNT];
+uniform float uMirrorProgressLeft[KORU_STAIN_LINE_COUNT];
+uniform float uMirrorProgressRight[KORU_STAIN_LINE_COUNT];
+uniform vec3 uModelMin;
+uniform vec3 uModelSize;
+varying vec3 vStainPosition;
+
+vec4 getCarvingLineData(int lineIndex) {
+  ${lineDataGlsl}
+
+  return vec4(0.0);
+}
+
+float getCarvingLineRadius(int lineIndex) {
+  ${lineRadiusGlsl}
+
+  return 0.03;
+}
+
+float getCarvingMask(vec2 stainUv, int lineIndex, float sideSign, float progress) {
+  if (progress <= 0.001) {
+    return 0.0;
+  }
+
+  vec4 lineData = getCarvingLineData(lineIndex);
+  float t = clamp((stainUv.y - lineData.x) / max(lineData.y - lineData.x, 0.0001), 0.0, 1.0);
+  float lineY = mix(lineData.x, lineData.y, t);
+  float wave = sin(t * 3.14159265);
+  float twist = sin(t * 6.2831853) * 0.025;
+  float lineX = 0.5 + sideSign * (lineData.z + lineData.w * wave + twist);
+  float radius = getCarvingLineRadius(lineIndex);
+  float distanceToLine = distance(stainUv, vec2(lineX, lineY));
+  float lineMask = 1.0 - smoothstep(radius, radius * 2.5, distanceToLine);
+  float pathGate = smoothstep(-0.02, 0.04, t) * (1.0 - smoothstep(0.96, 1.04, t));
+  float flowGate = 1.0 - smoothstep(progress, progress + 0.08, t);
+
+  return lineMask * pathGate * flowGate;
+}
+
+float getDirectStainMask(vec2 stainUv) {
+  float mask = 0.0;
+  ${directMaskGlsl}
+
+  return clamp(mask, 0.0, 1.0);
+}
+
+float getMirrorStainMask(vec2 stainUv) {
+  float mask = 0.0;
+  ${mirrorMaskGlsl}
+
+  return clamp(mask, 0.0, 1.0);
+}
+`
+
+const STAIN_VERTEX_FRAGMENT = `
+vStainPosition = position;
+`
+
+const STAIN_COLOR_FRAGMENT = `
+vec2 koruStainUv = (vStainPosition.xy - uModelMin.xy) / max(uModelSize.xy, vec2(0.0001));
+koruStainUv = clamp(koruStainUv, vec2(0.0), vec2(1.0));
+float koruDirectStain = getDirectStainMask(koruStainUv);
+float koruMirrorStain = getMirrorStainMask(koruStainUv);
+float koruWetMask = clamp(koruDirectStain + koruMirrorStain * 0.95, 0.0, 1.0);
+float koruGrainPulse = 0.82 + 0.18 * sin((koruStainUv.x + koruStainUv.y) * 48.0 + uTime * 0.8);
+vec3 koruWetCedar = diffuseColor.rgb * vec3(0.5, 0.34, 0.22) * koruGrainPulse;
+diffuseColor.rgb = mix(diffuseColor.rgb, koruWetCedar, koruWetMask * uStainIntensity);
+float koruMirrorSheen = koruMirrorStain * (0.35 + 0.35 * sin(uTime * 6.5 + koruStainUv.y * 18.0));
+diffuseColor.rgb += vec3(0.16, 0.1, 0.045) * koruMirrorSheen * uStainIntensity;
+`
+
+const STAIN_ROUGHNESS_FRAGMENT = `
+roughnessFactor = mix(roughnessFactor, 0.38, koruWetMask * uStainIntensity);
+`
 
 function getBreathPulse(phase) {
   if (phase < 4) {
@@ -30,17 +172,152 @@ function getBreathPulse(phase) {
   return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
-export function Koru(props) {
+function createProgressArray() {
+  return new Float32Array(CARVING_LINE_COUNT)
+}
+
+function getLinePoint(line, sideSign, progress) {
+  const t = MathUtils.clamp(progress, 0, 1)
+  const wave = Math.sin(t * Math.PI)
+  const twist = Math.sin(t * Math.PI * 2) * 0.025
+
+  return {
+    x: 0.5 + sideSign * (line.halfOffset + line.curve * wave + twist),
+    y: MathUtils.lerp(line.yStart, line.yEnd, t),
+  }
+}
+
+function getClosestProgressOnLine(point, line, sideSign) {
+  const sampleCount = 32
+  let bestProgress = 0
+  let bestDistance = Infinity
+  let previousPoint = getLinePoint(line, sideSign, 0)
+
+  for (let index = 1; index <= sampleCount; index += 1) {
+    const segmentEndProgress = index / sampleCount
+    const nextPoint = getLinePoint(line, sideSign, segmentEndProgress)
+    const segmentX = nextPoint.x - previousPoint.x
+    const segmentY = nextPoint.y - previousPoint.y
+    const lengthSquared = segmentX * segmentX + segmentY * segmentY
+    const projection =
+      lengthSquared > 0
+        ? MathUtils.clamp(
+            ((point.x - previousPoint.x) * segmentX + (point.y - previousPoint.y) * segmentY) /
+              lengthSquared,
+            0,
+            1,
+          )
+        : 0
+    const projectedX = previousPoint.x + segmentX * projection
+    const projectedY = previousPoint.y + segmentY * projection
+    const distance = Math.hypot(point.x - projectedX, point.y - projectedY)
+
+    if (distance < bestDistance) {
+      bestDistance = distance
+      bestProgress = MathUtils.lerp((index - 1) / sampleCount, segmentEndProgress, projection)
+    }
+
+    previousPoint = nextPoint
+  }
+
+  return { distance: bestDistance, progress: bestProgress }
+}
+
+function getNormalizedMeshPoint(localPoint, meshBounds) {
+  return {
+    x: (localPoint.x - meshBounds.min.x) / meshBounds.size.x,
+    y: (localPoint.y - meshBounds.min.y) / meshBounds.size.y,
+  }
+}
+
+function identifyCarvingLine(localPoint, meshBounds) {
+  if (!meshBounds?.size?.x || !meshBounds?.size?.y) {
+    return null
+  }
+
+  const point = getNormalizedMeshPoint(localPoint, meshBounds)
+  let bestMatch = null
+
+  CARVING_LINES.forEach((line, lineIndex) => {
+    Object.entries(SIDE_SIGNS).forEach(([side, sideSign]) => {
+      const candidate = getClosestProgressOnLine(point, line, sideSign)
+      const touchRadius = Math.max(line.radius * 2.8, 0.085)
+
+      if (candidate.distance <= touchRadius && (!bestMatch || candidate.distance < bestMatch.distance)) {
+        bestMatch = {
+          distance: candidate.distance,
+          lineIndex,
+          lineName: line.name,
+          progress: MathUtils.clamp(candidate.progress + 0.035, 0, 1),
+          side,
+        }
+      }
+    })
+  })
+
+  return bestMatch
+}
+
+export function Koru({ onTracingChange, ...props }) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
   const baseHeadRotation = useRef(null)
+  const directProgress = useRef({
+    left: createProgressArray(),
+    right: createProgressArray(),
+  })
+  const mirrorProgress = useRef({
+    left: createProgressArray(),
+    right: createProgressArray(),
+  })
+  const mirrorTargets = useRef({
+    left: createProgressArray(),
+    right: createProgressArray(),
+  })
+  const stainEnergy = useRef(0.72)
+  const activeTrace = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
   const externalMaps = useTexture(EXTERNAL_TEXTURES)
   const meshNodes = useMemo(() => {
     return Object.values(nodes).filter((node) => node?.isMesh)
   }, [nodes])
+  const meshBounds = useMemo(() => {
+    const bounds = new Box3()
+
+    meshNodes.forEach((node) => {
+      node.geometry.computeBoundingBox()
+
+      if (node.geometry.boundingBox) {
+        bounds.union(node.geometry.boundingBox)
+      }
+    })
+
+    if (bounds.isEmpty()) {
+      bounds.set(new Vector3(-0.5, -0.5, -0.5), new Vector3(0.5, 0.5, 0.5))
+    }
+
+    const size = bounds.getSize(new Vector3())
+
+    return {
+      min: bounds.min.clone(),
+      size,
+    }
+  }, [meshNodes])
+  const stainUniforms = useMemo(
+    () => ({
+      uTime: { value: 0 },
+      uStainIntensity: { value: stainEnergy.current },
+      uStainProgressLeft: { value: createProgressArray() },
+      uStainProgressRight: { value: createProgressArray() },
+      uMirrorProgressLeft: { value: createProgressArray() },
+      uMirrorProgressRight: { value: createProgressArray() },
+      uModelMin: { value: meshBounds.min.clone() },
+      uModelSize: { value: meshBounds.size.clone() },
+    }),
+    [meshBounds],
+  )
   const meshDescriptors = useMemo(() => {
     return meshNodes.map((node) => ({
       key: node.uuid,
@@ -57,7 +334,7 @@ export function Koru(props) {
       ? materialFallback.clone()
       : new MeshStandardMaterial()
 
-    sourceMaterial.name = 'KoruExternalTextureOverride'
+    sourceMaterial.name = 'KoruCarvingStainMaterial'
     sourceMaterial.map = externalMaps.baseColor
     sourceMaterial.roughnessMap = externalMaps.roughness
     sourceMaterial.normalMap = externalMaps.normal
@@ -68,6 +345,24 @@ export function Koru(props) {
     sourceMaterial.normalScale.set(0.85, 0.85)
     sourceMaterial.roughness = 1
     sourceMaterial.metalness = 0.04
+    sourceMaterial.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, stainUniforms)
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+varying vec3 vStainPosition;`,
+        )
+        .replace('#include <begin_vertex>', `#include <begin_vertex>\n${STAIN_VERTEX_FRAGMENT}`)
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\n${STAIN_SHADER_COMMON}`)
+        .replace('#include <map_fragment>', `#include <map_fragment>\n${STAIN_COLOR_FRAGMENT}`)
+        .replace(
+          '#include <roughnessmap_fragment>',
+          `#include <roughnessmap_fragment>\n${STAIN_ROUGHNESS_FRAGMENT}`,
+        )
+    }
+    sourceMaterial.customProgramCacheKey = () => 'koru-carving-stain-v1'
     sourceMaterial.needsUpdate = true
 
     return sourceMaterial
@@ -76,6 +371,7 @@ export function Koru(props) {
     externalMaps.baseColor,
     externalMaps.roughness,
     externalMaps.normal,
+    stainUniforms,
   ])
 
   useEffect(() => {
@@ -106,6 +402,7 @@ export function Koru(props) {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
     const breathPulse = getBreathPulse(phase)
     const body = bodyRef.current
+    const mirrorEasing = 1 - Math.exp(-5 * delta)
 
     if (body) {
       if (!baseBodyScale.current) {
@@ -141,26 +438,118 @@ export function Koru(props) {
         tiltEasing,
       )
     }
+
+    stainEnergy.current = MathUtils.lerp(
+      stainEnergy.current,
+      activeTrace.current ? 1 : 0.72,
+      1 - Math.exp(-3 * delta),
+    )
+    stainUniforms.uTime.value = clock.elapsedTime
+    stainUniforms.uStainIntensity.value = stainEnergy.current
+
+    CARVING_LINES.forEach((_, index) => {
+      mirrorProgress.current.left[index] = MathUtils.lerp(
+        mirrorProgress.current.left[index],
+        mirrorTargets.current.left[index],
+        mirrorEasing,
+      )
+      mirrorProgress.current.right[index] = MathUtils.lerp(
+        mirrorProgress.current.right[index],
+        mirrorTargets.current.right[index],
+        mirrorEasing,
+      )
+      stainUniforms.uStainProgressLeft.value[index] = directProgress.current.left[index]
+      stainUniforms.uStainProgressRight.value[index] = directProgress.current.right[index]
+      stainUniforms.uMirrorProgressLeft.value[index] = mirrorProgress.current.left[index]
+      stainUniforms.uMirrorProgressRight.value[index] = mirrorProgress.current.right[index]
+    })
   })
 
   const setInteracting = (value) => {
     interactionTarget.current = value
   }
 
+  const endTracing = useCallback(() => {
+    activeTrace.current = null
+    setInteracting(0)
+    onTracingChange?.(false)
+  }, [onTracingChange])
+
+  const onMeshTouch = useCallback(
+    (event) => {
+      if (!event?.point || !event?.object) {
+        return null
+      }
+
+      event.stopPropagation()
+      const localPoint = event.object.worldToLocal(event.point.clone())
+      const carvingHit = identifyCarvingLine(localPoint, meshBounds)
+
+      if (!carvingHit) {
+        return null
+      }
+
+      const mirrorSide = MIRROR_SIDE[carvingHit.side]
+      directProgress.current[carvingHit.side][carvingHit.lineIndex] = Math.max(
+        directProgress.current[carvingHit.side][carvingHit.lineIndex],
+        carvingHit.progress,
+      )
+      mirrorTargets.current[mirrorSide][carvingHit.lineIndex] = Math.max(
+        mirrorTargets.current[mirrorSide][carvingHit.lineIndex],
+        carvingHit.progress,
+      )
+      activeTrace.current = carvingHit
+      setInteracting(1)
+
+      return carvingHit
+    },
+    [meshBounds],
+  )
+
+  const tracingBind = useGesture(
+    {
+      onDrag: ({ event, first, last, active }) => {
+        if (first) {
+          onTracingChange?.(true)
+        }
+
+        if (last || !active) {
+          endTracing()
+          return
+        }
+
+        const carvingHit = onMeshTouch(event)
+
+        if (carvingHit) {
+          onTracingChange?.(true)
+        }
+      },
+      onHover: ({ event, hovering }) => {
+        if (!hovering) {
+          endTracing()
+          return
+        }
+
+        event.stopPropagation()
+        setInteracting(1)
+      },
+    },
+    {
+      drag: {
+        filterTaps: true,
+        threshold: 1,
+      },
+      eventOptions: {
+        passive: false,
+      },
+    },
+  )
+
   return (
     <group
       {...props}
+      {...tracingBind()}
       dispose={null}
-      onPointerOver={(event) => {
-        event.stopPropagation()
-        setInteracting(1)
-      }}
-      onPointerOut={() => setInteracting(0)}
-      onPointerDown={(event) => {
-        event.stopPropagation()
-        setInteracting(1)
-      }}
-      onPointerUp={() => setInteracting(0)}
     >
       <group ref={bodyRef}>
         {meshDescriptors.map((mesh) => (
