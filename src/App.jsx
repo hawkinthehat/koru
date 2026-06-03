@@ -17,7 +17,8 @@ export default function App() {
 
       <div className="canvas-wrap">
         <Canvas
-          camera={{ position: [0, 1.15, 4.25], fov: 38 }}
+          orthographic
+          camera={{ position: [0, 0, 6], zoom: 120, near: 0.1, far: 100 }}
           shadows
           dpr={[1, 2]}
         >
@@ -32,13 +33,15 @@ export default function App() {
           <pointLight position={[-5, 5, -5]} intensity={0.5} color="#008080" />
           <Suspense fallback={null}>
             <Center>
-              <Koru rotation={[0, -0.18, 0]} scale={2.2} />
+              <Koru scale={2.2} />
             </Center>
             <Environment preset="city" environmentIntensity={0.24} />
           </Suspense>
           <OrbitControls
+            enabled={false}
             enablePan={false}
             enableZoom={false}
+            enableRotate={false}
             minPolarAngle={Math.PI / 2.8}
             maxPolarAngle={Math.PI / 1.75}
           />
