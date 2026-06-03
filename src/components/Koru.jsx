@@ -4,10 +4,10 @@ Command: npx gltfjsx@6.5.3 public/Koru.glb --transform
 Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (95%)
 */
 
-import { useEffect, useMemo, useRef } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useGLTF, useTexture } from '@react-three/drei'
-import { MathUtils, MeshStandardMaterial, SRGBColorSpace } from 'three'
+import { CanvasTexture, Color, MathUtils, MeshStandardMaterial, SRGBColorSpace } from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
@@ -17,6 +17,9 @@ const EXTERNAL_TEXTURES = {
   roughness: '/textures/koru-roughness.png',
   normal: '/textures/koru-normal.png',
 }
+const TRACE_TEXTURE_SIZE = 512
+const TRACE_STAMP_RADIUS = 24
+const TRACE_GLOW_COLOR = '#5fe0d4'
 
 function getBreathPulse(phase) {
   if (phase < 4) {
@@ -30,14 +33,63 @@ function getBreathPulse(phase) {
   return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
+function createTraceLayer() {
+  const canvas = document.createElement('canvas')
+  canvas.width = TRACE_TEXTURE_SIZE
+  canvas.height = TRACE_TEXTURE_SIZE
+
+  const context = canvas.getContext('2d')
+  context.fillStyle = 'black'
+  context.fillRect(0, 0, TRACE_TEXTURE_SIZE, TRACE_TEXTURE_SIZE)
+
+  const texture = new CanvasTexture(canvas)
+  texture.flipY = false
+
+  return { canvas, context, texture }
+}
+
+function getPointerUv(event, canvas) {
+  const bounds = canvas.getBoundingClientRect()
+
+  if (!bounds.width || !bounds.height) {
+    return null
+  }
+
+  return {
+    u: MathUtils.clamp((event.clientX - bounds.left) / bounds.width, 0, 1),
+    v: MathUtils.clamp(1 - (event.clientY - bounds.top) / bounds.height, 0, 1),
+  }
+}
+
+function stampTracePoint(context, u, v) {
+  const x = u * TRACE_TEXTURE_SIZE
+  const y = (1 - v) * TRACE_TEXTURE_SIZE
+  const gradient = context.createRadialGradient(x, y, 0, x, y, TRACE_STAMP_RADIUS)
+
+  gradient.addColorStop(0, 'rgba(255, 255, 255, 0.95)')
+  gradient.addColorStop(0.45, 'rgba(255, 255, 255, 0.42)')
+  gradient.addColorStop(1, 'rgba(255, 255, 255, 0)')
+
+  context.globalCompositeOperation = 'lighter'
+  context.fillStyle = gradient
+  context.beginPath()
+  context.arc(x, y, TRACE_STAMP_RADIUS, 0, Math.PI * 2)
+  context.fill()
+  context.globalCompositeOperation = 'source-over'
+}
+
 export function Koru(props) {
   const { nodes, materials } = useGLTF('/Koru.glb')
+  const { gl } = useThree()
   const bodyRef = useRef(null)
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
   const baseHeadRotation = useRef(null)
+  const isTracing = useRef(false)
+  const activePointerId = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
   const externalMaps = useTexture(EXTERNAL_TEXTURES)
+  const traceLayer = useMemo(() => createTraceLayer(), [])
   const meshNodes = useMemo(() => {
     return Object.values(nodes).filter((node) => node?.isMesh)
   }, [nodes])
@@ -68,6 +120,9 @@ export function Koru(props) {
     sourceMaterial.normalScale.set(0.85, 0.85)
     sourceMaterial.roughness = 1
     sourceMaterial.metalness = 0.04
+    sourceMaterial.emissive = new Color(TRACE_GLOW_COLOR)
+    sourceMaterial.emissiveMap = traceLayer.texture
+    sourceMaterial.emissiveIntensity = 1.15
     sourceMaterial.needsUpdate = true
 
     return sourceMaterial
@@ -76,6 +131,7 @@ export function Koru(props) {
     externalMaps.baseColor,
     externalMaps.roughness,
     externalMaps.normal,
+    traceLayer.texture,
   ])
 
   useEffect(() => {
@@ -83,6 +139,12 @@ export function Koru(props) {
       overrideMaterial.dispose()
     }
   }, [overrideMaterial])
+
+  useEffect(() => {
+    return () => {
+      traceLayer.texture.dispose()
+    }
+  }, [traceLayer.texture])
 
   const headBone = useMemo(() => {
     const graphNodes = Object.values(nodes)
@@ -147,6 +209,96 @@ export function Koru(props) {
     interactionTarget.current = value
   }
 
+  const stampMirroredTrace = useCallback(
+    ({ u, v }) => {
+      if (!traceLayer.context) {
+        return
+      }
+
+      // The fixed orthographic camera keeps screen UVs aligned with the Koru texture.
+      stampTracePoint(traceLayer.context, u, v)
+      stampTracePoint(traceLayer.context, 1 - u, v)
+      traceLayer.texture.needsUpdate = true
+    },
+    [traceLayer],
+  )
+
+  const endTracing = useCallback(() => {
+    isTracing.current = false
+    activePointerId.current = null
+    setInteracting(0)
+  }, [])
+
+  const handlePointerMove = useCallback(
+    (event) => {
+      if (!isTracing.current) {
+        return
+      }
+
+      const uv = getPointerUv(event, gl.domElement)
+
+      if (!uv) {
+        return
+      }
+
+      if (event.cancelable) {
+        event.preventDefault()
+      }
+      stampMirroredTrace(uv)
+      setInteracting(1)
+    },
+    [gl.domElement, stampMirroredTrace],
+  )
+
+  const handlePointerDown = useCallback(
+    (event) => {
+      if (!event.isPrimary) {
+        return
+      }
+
+      isTracing.current = true
+      activePointerId.current = event.pointerId
+      if (gl.domElement.setPointerCapture) {
+        gl.domElement.setPointerCapture(event.pointerId)
+      }
+      handlePointerMove(event)
+    },
+    [gl.domElement, handlePointerMove],
+  )
+
+  const handlePointerEnd = useCallback(
+    (event) => {
+      if (activePointerId.current !== null && event.pointerId !== activePointerId.current) {
+        return
+      }
+
+      if (gl.domElement.hasPointerCapture?.(event.pointerId)) {
+        gl.domElement.releasePointerCapture(event.pointerId)
+      }
+      endTracing()
+    },
+    [endTracing, gl.domElement],
+  )
+
+  useEffect(() => {
+    const canvas = gl.domElement
+    const listenerOptions = { passive: false }
+
+    canvas.addEventListener('pointerdown', handlePointerDown, listenerOptions)
+    canvas.addEventListener('pointermove', handlePointerMove, listenerOptions)
+    canvas.addEventListener('pointerup', handlePointerEnd, listenerOptions)
+    canvas.addEventListener('pointercancel', handlePointerEnd, listenerOptions)
+    canvas.addEventListener('pointerleave', handlePointerEnd, listenerOptions)
+
+    return () => {
+      canvas.removeEventListener('pointerdown', handlePointerDown)
+      canvas.removeEventListener('pointermove', handlePointerMove)
+      canvas.removeEventListener('pointerup', handlePointerEnd)
+      canvas.removeEventListener('pointercancel', handlePointerEnd)
+      canvas.removeEventListener('pointerleave', handlePointerEnd)
+    }
+  }, [gl.domElement, handlePointerDown, handlePointerEnd, handlePointerMove])
+
   return (
     <group
       {...props}
@@ -160,7 +312,7 @@ export function Koru(props) {
         event.stopPropagation()
         setInteracting(1)
       }}
-      onPointerUp={() => setInteracting(0)}
+      onPointerUp={endTracing}
     >
       <group ref={bodyRef}>
         {meshDescriptors.map((mesh) => (
