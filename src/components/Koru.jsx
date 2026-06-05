@@ -30,12 +30,13 @@ function getBreathPulse(phase) {
   return Math.cos(((phase - 11) / 8) * (Math.PI / 2))
 }
 
-export function Koru(props) {
+export function Koru({ onBreathCycleComplete, ...props }) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
   const baseHeadRotation = useRef(null)
+  const lastReportedBreathCycle = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
   const externalMaps = useTexture(EXTERNAL_TEXTURES)
   const meshNodes = useMemo(() => {
@@ -104,8 +105,16 @@ export function Koru(props) {
 
   useFrame(({ clock, pointer }, delta) => {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
+    const cycleIndex = Math.floor(clock.elapsedTime / BREATH_CYCLE_SECONDS)
     const breathPulse = getBreathPulse(phase)
     const body = bodyRef.current
+
+    if (lastReportedBreathCycle.current === null) {
+      lastReportedBreathCycle.current = cycleIndex
+    } else if (cycleIndex > lastReportedBreathCycle.current) {
+      lastReportedBreathCycle.current = cycleIndex
+      onBreathCycleComplete?.()
+    }
 
     if (body) {
       if (!baseBodyScale.current) {
