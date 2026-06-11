@@ -277,11 +277,12 @@ h1 {
   box-shadow:
     0 2rem 6rem rgba(0, 0, 0, 0.34),
     inset 0 0 4rem rgba(95, 224, 212, 0.05);
-  cursor: pointer;
+  cursor: crosshair;
 }
 
 .canvas-wrap canvas {
   display: block;
+  touch-action: none;
 }
 
 .safe-harbor-panel {

@@ -70,6 +70,7 @@ function BreathingLoop() {
 export default function App() {
   const [activeProtocol, setActiveProtocol] = useState('breathe')
   const [isSafeHarborActive, setIsSafeHarborActive] = useState(false)
+  const [isTracing, setIsTracing] = useState(false)
   const { entries, recordSession } = useSessionLedger()
   const handleBreathCycleComplete = useCallback(() => {
     recordSession('breathing-cycle')
@@ -90,9 +91,9 @@ export default function App() {
             <p className="eyebrow">Somatic grounding companion</p>
             <h1>Meet Koru</h1>
             <p className="hero-copy__intro">
-              Breathe with Koru's slow 4-7-8 rhythm. Press or hover over him to
-              invite a gentle lateral head tilt. Press and hold Koru's chest for
-              3 seconds to enter Safe Harbor.
+              Trace Koru's carving lines to wake cedar stains across the grain.
+              Stay with the 4-7-8 rhythm, or press and hold Koru's chest for 3
+              seconds to enter Safe Harbor.
             </p>
 
             <section className="protocol-menu" aria-labelledby="protocol-menu-heading">
@@ -172,6 +173,7 @@ export default function App() {
                   <Koru
                     rotation={[0, -0.18, 0]}
                     scale={2.2}
+                    onTracingChange={setIsTracing}
                     onBreathCycleComplete={handleBreathCycleComplete}
                     onSafeHarborActivate={() => setIsSafeHarborActive(true)}
                   />
@@ -179,6 +181,7 @@ export default function App() {
                 <Environment preset="city" environmentIntensity={0.24} />
               </Suspense>
               <OrbitControls
+                enabled={!isTracing}
                 enablePan={false}
                 enableZoom={false}
                 minPolarAngle={Math.PI / 2.8}
