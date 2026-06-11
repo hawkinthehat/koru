@@ -4,15 +4,20 @@ Command: npx gltfjsx@6.5.3 public/Koru.glb --transform
 Files: public/Koru.glb [354.16KB] > /workspace/Koru-transformed.glb [18.61KB] (95%)
 */
 
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { useGLTF, useTexture } from '@react-three/drei'
 import { useGesture } from '@use-gesture/react'
-import { Box3, MathUtils, MeshStandardMaterial, SRGBColorSpace, Vector3 } from 'three'
+import { AdditiveBlending, Box3, MathUtils, MeshStandardMaterial, SRGBColorSpace, Vector3 } from 'three'
 
 const BREATH_CYCLE_SECONDS = 19
 const HEAD_TILT_RADIANS = MathUtils.degToRad(15)
 const BREATH_AMPLITUDE = 0.02
+const SAFE_HARBOR_HOLD_MS = 3000
+const CHEST_TARGET_POSITION = [0, 0.02, 0.56]
+const CHEST_TARGET_SCALE = [1, 0.82, 0.32]
+const CHEST_TARGET_RADIUS = 0.28
+const CHEST_PULSE_RADIUS = 0.3
 const EXTERNAL_TEXTURES = {
   baseColor: '/textures/koru-basecolor.png',
   roughness: '/textures/koru-roughness.png',
@@ -258,9 +263,18 @@ function identifyCarvingLine(localPoint, meshBounds) {
   return bestMatch
 }
 
-export function Koru({ onTracingChange, ...props }) {
+export function Koru({
+  onTracingChange,
+  onBreathCycleComplete,
+  onSafeHarborActivate,
+  safeHarborHoldMs = SAFE_HARBOR_HOLD_MS,
+  ...props
+}) {
   const { nodes, materials } = useGLTF('/Koru.glb')
   const bodyRef = useRef(null)
+  const chestPulseRef = useRef(null)
+  const chestPulseMaterialRef = useRef(null)
+  const holdTimeoutRef = useRef(null)
   const interactionTarget = useRef(0)
   const baseBodyScale = useRef(null)
   const baseHeadRotation = useRef(null)
@@ -278,6 +292,8 @@ export function Koru({ onTracingChange, ...props }) {
   })
   const stainEnergy = useRef(0.72)
   const activeTrace = useRef(null)
+  const [isSafeHarborHolding, setIsSafeHarborHolding] = useState(false)
+  const lastReportedBreathCycle = useRef(null)
   const materialFallback = useMemo(() => Object.values(materials ?? {})[0] ?? null, [materials])
   const externalMaps = useTexture(EXTERNAL_TEXTURES)
   const meshNodes = useMemo(() => {
@@ -380,6 +396,14 @@ varying vec3 vStainPosition;`,
     }
   }, [overrideMaterial])
 
+  useEffect(() => {
+    return () => {
+      if (holdTimeoutRef.current) {
+        window.clearTimeout(holdTimeoutRef.current)
+      }
+    }
+  }, [])
+
   const headBone = useMemo(() => {
     const graphNodes = Object.values(nodes)
     const directBoneMatch = graphNodes.find((node) => {
@@ -400,9 +424,17 @@ varying vec3 vStainPosition;`,
 
   useFrame(({ clock, pointer }, delta) => {
     const phase = clock.elapsedTime % BREATH_CYCLE_SECONDS
+    const cycleIndex = Math.floor(clock.elapsedTime / BREATH_CYCLE_SECONDS)
     const breathPulse = getBreathPulse(phase)
     const body = bodyRef.current
     const mirrorEasing = 1 - Math.exp(-5 * delta)
+
+    if (lastReportedBreathCycle.current === null) {
+      lastReportedBreathCycle.current = cycleIndex
+    } else if (cycleIndex > lastReportedBreathCycle.current) {
+      lastReportedBreathCycle.current = cycleIndex
+      onBreathCycleComplete?.()
+    }
 
     if (body) {
       if (!baseBodyScale.current) {
@@ -463,6 +495,25 @@ varying vec3 vStainPosition;`,
       stainUniforms.uMirrorProgressLeft.value[index] = mirrorProgress.current.left[index]
       stainUniforms.uMirrorProgressRight.value[index] = mirrorProgress.current.right[index]
     })
+    const chestPulse = chestPulseRef.current
+    const chestPulseMaterial = chestPulseMaterialRef.current
+
+    if (chestPulse && chestPulseMaterial) {
+      const pulseWave = 0.5 + Math.sin(clock.elapsedTime * Math.PI * 1.8) * 0.5
+      const targetOpacity = isSafeHarborHolding ? 0.18 + pulseWave * 0.18 : 0
+      const targetScale = isSafeHarborHolding ? 0.98 + pulseWave * 0.12 : 0.9
+      const pulseEasing = 1 - Math.exp(-10 * delta)
+
+      chestPulse.visible = isSafeHarborHolding || chestPulseMaterial.opacity > 0.01
+      chestPulse.scale.x = MathUtils.lerp(chestPulse.scale.x, targetScale, pulseEasing)
+      chestPulse.scale.y = MathUtils.lerp(chestPulse.scale.y, targetScale, pulseEasing)
+      chestPulse.scale.z = MathUtils.lerp(chestPulse.scale.z, targetScale, pulseEasing)
+      chestPulseMaterial.opacity = MathUtils.lerp(
+        chestPulseMaterial.opacity,
+        targetOpacity,
+        pulseEasing,
+      )
+    }
   })
 
   const setInteracting = (value) => {
@@ -545,6 +596,51 @@ varying vec3 vStainPosition;`,
     },
   )
 
+  const cancelSafeHarborHold = useCallback(() => {
+    if (holdTimeoutRef.current) {
+      window.clearTimeout(holdTimeoutRef.current)
+      holdTimeoutRef.current = null
+    }
+
+    setIsSafeHarborHolding(false)
+  }, [])
+
+  const startSafeHarborHold = useCallback(
+    (event) => {
+      event.stopPropagation()
+      setInteracting(1)
+
+      if (!onSafeHarborActivate || holdTimeoutRef.current) {
+        return
+      }
+
+      event.target?.setPointerCapture?.(event.pointerId)
+      setIsSafeHarborHolding(true)
+      holdTimeoutRef.current = window.setTimeout(() => {
+        holdTimeoutRef.current = null
+        setIsSafeHarborHolding(false)
+        onSafeHarborActivate()
+      }, safeHarborHoldMs)
+    },
+    [onSafeHarborActivate, safeHarborHoldMs],
+  )
+
+  const stopSafeHarborHold = useCallback(
+    (event) => {
+      event?.stopPropagation()
+
+      if (event?.target?.hasPointerCapture?.(event.pointerId)) {
+        event.target.releasePointerCapture(event.pointerId)
+      }
+
+      cancelSafeHarborHold()
+      setInteracting(0)
+    },
+    [cancelSafeHarborHold],
+  )
+
+  const ignoreRaycast = useCallback(() => null, [])
+
   return (
     <group
       {...props}
@@ -565,6 +661,34 @@ varying vec3 vStainPosition;`,
             receiveShadow
           />
         ))}
+        <mesh
+          position={CHEST_TARGET_POSITION}
+          scale={CHEST_TARGET_SCALE}
+          onPointerDown={startSafeHarborHold}
+          onPointerUp={stopSafeHarborHold}
+          onPointerOut={stopSafeHarborHold}
+          onPointerCancel={stopSafeHarborHold}
+          onLostPointerCapture={stopSafeHarborHold}
+        >
+          <sphereGeometry args={[CHEST_TARGET_RADIUS, 24, 16]} />
+          <meshBasicMaterial transparent opacity={0} depthWrite={false} colorWrite={false} />
+        </mesh>
+        <mesh
+          ref={chestPulseRef}
+          position={CHEST_TARGET_POSITION}
+          raycast={ignoreRaycast}
+          visible={false}
+        >
+          <sphereGeometry args={[CHEST_PULSE_RADIUS, 32, 16]} />
+          <meshBasicMaterial
+            ref={chestPulseMaterialRef}
+            color="#ffffff"
+            transparent
+            opacity={0}
+            depthWrite={false}
+            blending={AdditiveBlending}
+          />
+        </mesh>
       </group>
     </group>
   )
